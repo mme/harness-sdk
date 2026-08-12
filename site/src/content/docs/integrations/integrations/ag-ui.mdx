@@ -186,6 +186,146 @@ Start the UI:
 npm run dev:ui
 ```
 
+## Run your agent in Slack with CopilotKit Channels
+
+The same Strands agent that powers your web UI can also run as a bot in Slack and
+other messaging platforms.
+[CopilotKit Channels](https://docs.copilotkit.ai/slack/aws-strands) connects an
+AG-UI agent to messaging platforms, with threads, tool calls, and rich
+interactive messages handled natively in the channel.
+
+Your agent server stays where it is. A channel is a separate long-running Node
+process built with `@copilotkit/channels`, connected through CopilotKit
+Intelligence - a required surface for Channels, by design (a free tier is
+available). Intelligence holds the platform connection and credentials, receives
+each platform event, and delivers the turn to your channel process, which runs
+your agent over AG-UI and streams the reply back into the platform thread.
+
+```
+Slack -> CopilotKit Intelligence -> channel process (Node) -> Strands agent (AG-UI)
+```
+
+### Serve the agent over AG-UI
+
+If your agent is not yet served over AG-UI, the
+[`ag-ui-strands`](https://pypi.org/project/ag-ui-strands/) package wraps a
+`strands.Agent` in a FastAPI app that speaks the protocol:
+
+```bash
+pip install ag-ui-strands strands-agents uvicorn
+```
+
+```python title="server.py"
+import uvicorn
+from strands import Agent
+from ag_ui_strands import StrandsAgent, create_strands_app
+
+strands_agent = Agent(system_prompt="You are a helpful assistant.")
+
+agui_agent = StrandsAgent(
+    agent=strands_agent,
+    name="assistant",
+    description="Conversational Strands agent with AG-UI streaming",
+)
+
+app = create_strands_app(agui_agent, "/")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+### Point a channel at it
+
+In a separate Node project, install the Channels SDK, the CopilotKit runtime, and
+the AG-UI client for Strands:
+
+```bash
+npm install @copilotkit/channels @copilotkit/runtime @ag-ui/aws-strands
+```
+
+Create a Channel in the
+[CopilotKit Intelligence](https://docs.copilotkit.ai/slack/aws-strands) dashboard
+and connect Slack there - Intelligence walks you through the Slack app
+setup and holds its credentials, which never enter your process. That leaves two
+environment variables: `INTELLIGENCE_API_KEY` and `INTELLIGENCE_CHANNEL_ID`, both
+from the dashboard.
+
+Build the agent as a per-thread factory so each conversation gets its own
+session, using `AWSStrandsAgent` from `@ag-ui/aws-strands`:
+
+```typescript title="channel.ts"
+import { createChannel } from "@copilotkit/channels";
+import { CopilotRuntime, CopilotKitIntelligence } from "@copilotkit/runtime/v2";
+import { createCopilotNodeListener } from "@copilotkit/runtime/v2/node";
+import { AWSStrandsAgent } from "@ag-ui/aws-strands";
+
+const required = (name: string) => {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+};
+
+const channel = createChannel({
+  name: required("INTELLIGENCE_CHANNEL_ID"), // the Channel ID from Intelligence
+  identifyUser: "platform",
+  // A fresh agent per conversation, pointed at your AG-UI server.
+  agent: (threadId) => {
+    const agent = new AWSStrandsAgent({ url: "http://localhost:8000/" });
+    agent.threadId = threadId;
+    return agent;
+  },
+});
+
+// A mention subscribes the thread and runs the agent; afterwards every message
+// in a subscribed thread runs it without needing another mention.
+channel.onMention(async ({ thread }) => {
+  await thread.subscribe();
+  await thread.runAgent();
+});
+channel.onMessage(async ({ thread }) => {
+  if (await thread.isSubscribed()) await thread.runAgent();
+});
+
+// The runtime owns the channel's lifecycle - there is no `channel.start()`.
+const runtime = new CopilotRuntime({
+  agents: {}, // the channel supplies its own agent; no web-facing agents needed
+  intelligence: new CopilotKitIntelligence({
+    apiKey: required("INTELLIGENCE_API_KEY"), // free tier available
+  }),
+  channels: [channel],
+});
+
+const listener = createCopilotNodeListener({ runtime });
+await listener.channels?.ready({ timeoutMs: 15_000 });
+```
+
+Run both processes:
+
+```bash
+python server.py    # terminal 1 - Strands agent over AG-UI
+npx tsx channel.ts  # terminal 2 - channel process
+```
+
+Mention the bot in Slack and it runs your Strands agent, streaming the reply back
+into the thread; the thread stays subscribed, so follow-up messages run without
+another mention. The channel process holds a persistent connection to the
+Intelligence gateway, which delivers each turn to it, so it needs a long-running
+host - a serverless request handler cannot own that connection.
+
+The agent receives ordinary AG-UI input and emits ordinary AG-UI events; the
+platform mechanics stay behind the channel, so the same Strands agent runs
+unchanged across every platform. Other messaging platforms connect the same way -
+a managed connection configured in Intelligence, with your channel code
+unchanged. See the
+[CopilotKit Channels documentation](https://docs.copilotkit.ai/slack/aws-strands)
+for the current platform list, per-platform setup, rich messages, and approvals.
+
+:::note
+By default, interactive actions and per-thread state live in memory and reset
+when the channel process restarts. Back the channel with a durable action and
+state store so buttons and per-thread state survive restarts.
+:::
+
 ## Resources
 
 To see what other features you can build into your UI with AG-UI, refer to the CopilotKit docs:
